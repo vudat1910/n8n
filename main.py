@@ -22,8 +22,8 @@ def get_db_connection():
         print(f"Error connecting to PostgreSQL: {e}")
         return None
 
-# Hàm kiểm tra và điều chỉnh bảng
-def adjust_table_if_needed(connection, table_name, data_sample):
+# Hàm kiểm tra và tạo bảng nếu chưa tồn tại
+def create_table_if_not_exists(connection, table_name, data_sample):
     try:
         with connection.cursor() as cursor:
             # Kiểm tra xem bảng có tồn tại không
@@ -36,8 +36,9 @@ def adjust_table_if_needed(connection, table_name, data_sample):
             table_exists = cursor.fetchone()[0]
 
             if not table_exists:
-                # Tạo bảng mới
+                # Lấy tên cột từ file XLSX
                 columns = data_sample.columns.tolist()
+                # Tạo câu lệnh SQL để tạo bảng
                 column_definitions = ["id SERIAL PRIMARY KEY"]
                 for col in columns:
                     column_definitions.append(f"{col} VARCHAR(255)")
@@ -51,64 +52,45 @@ def adjust_table_if_needed(connection, table_name, data_sample):
                 connection.commit()
                 print(f"Table {table_name} created successfully")
             else:
-                # Kiểm tra cột hiện tại của bảng
-                cursor.execute("""
-                    SELECT column_name 
-                    FROM information_schema.columns 
-                    WHERE table_name = %s;
-                """, (table_name,))
-                existing_columns = [row[0] for row in cursor.fetchall() if row[0] not in ['id', 'created_at']]
-
-                # Lấy cột từ file XLSX
-                new_columns = data_sample.columns.tolist()
-                
-                # Thêm cột mới nếu cần
-                for col in new_columns:
-                    if col not in existing_columns:
-                        cursor.execute(f"""
-                            ALTER TABLE {table_name}
-                            ADD COLUMN {col} VARCHAR(255);
-                        """)
-                        print(f"Added column {col} to {table_name}")
-                connection.commit()
-
+                print(f"Table {table_name} already exists")
     except Exception as e:
-        print(f"Error adjusting table: {e}")
+        print(f"Error creating table: {e}")
         raise
 
-# Endpoint nhận dữ liệu JSON hoặc file XLSX
+# Endpoint nhận nhiều file XLSX hoặc dữ liệu JSON
 @app.post("/api-one-task")
-async def ingest_data(request: Request, file: UploadFile = File(None)):
+async def ingest_data(request: Request, files: List[UploadFile] = File(None)):
     connection = get_db_connection()
     if connection is None:
         return {"error": "Database connection failed"}
 
     try:
         # Trường hợp nhận file XLSX
-        if file:
-            # Đọc file XLSX
-            df = pd.read_excel(file.file)
-            table_name = "data_table"
-            
-            # Kiểm tra và điều chỉnh bảng
-            adjust_table_if_needed(connection, table_name, df)
-            
-            # Lấy danh sách cột từ file XLSX
-            columns = df.columns.tolist()
-            # Tạo câu lệnh INSERT động
-            placeholders = ', '.join(['%s'] * len(columns))
-            column_names = ', '.join(columns)
-            insert_query = f"INSERT INTO {table_name} ({column_names}) VALUES ({placeholders})"
-            
-            with connection.cursor() as cursor:
-                for _, row in df.iterrows():
-                    values = []
-                    for col in columns:
-                        value = str(row.get(col, ''))  # Dùng giá trị rỗng nếu cột không tồn tại trong hàng
-                        values.append(value)
-                    cursor.execute(insert_query, tuple(values))
-                connection.commit()
-            return {"status": "success", "message": "Data ingested from XLSX"}
+        if files:
+            results = []
+            for file in files:
+                # Tạo tên bảng dựa trên tên file (loại bỏ đuôi .xlsx)
+                table_name = f"table_{file.filename.replace('.xlsx', '').replace('.', '_')}"
+                
+                # Đọc file XLSX
+                df = pd.read_excel(file.file)
+                
+                # Kiểm tra và tạo bảng dựa trên cấu trúc của XLSX
+                create_table_if_not_exists(connection, table_name, df)
+                
+                # Lấy danh sách cột từ file XLSX
+                columns = df.columns.tolist()
+                # Tạo câu lệnh INSERT động
+                placeholders = ', '.join(['%s'] * len(columns))
+                column_names = ', '.join(columns)
+                insert_query = f"INSERT INTO {table_name} ({column_names}) VALUES ({placeholders})"
+                
+                with connection.cursor() as cursor:
+                    for _, row in df.iterrows():
+                        cursor.execute(insert_query, tuple(str(row[col]) for col in columns))
+                    connection.commit()
+                results.append({"file": file.filename, "status": "success", "message": f"Data ingested into {table_name}"})
+            return results
 
         # Trường hợp nhận dữ liệu JSON
         else:
